@@ -1,13 +1,20 @@
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression 
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from xgboost import XGBClassifier, XGBRegressor
+from catboost import CatBoostClassifier, CatBoostRegressor, Pool
+
 from sklearn.model_selection import train_test_split, LearningCurveDisplay, GridSearchCV
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, mean_squared_error, r2_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, root_mean_squared_error, r2_score
 from sklearn.feature_selection import SelectKBest
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
+
+from .GeneralDataProcessors import TaskType, GeneralDataProcessor
 
 # Typing annotations
 from pandas import Series, DataFrame
@@ -97,3 +104,94 @@ def create_imputation_pipeline(df: pd.DataFrame) -> ColumnTransformer:
     )
     
     return preprocessor
+
+class ModelTester:
+    def __init__(self, train_data:DataFrame|ndarray|Series, target_column:list[str]|str, index_column:list[str]|str|None=None, eval_data:DataFrame|ndarray|Series|None=None, test_size:float=0.2) -> None:
+        self.test_size = test_size
+        self.data_processor = GeneralDataProcessor()
+        self.TARGET = target_column
+        self.INDEX = index_column
+        if eval_data is None:
+            train_data, eval_data = train_test_split(train_data, test_size=self.test_size)
+            
+        self.X_train, self.y_train = self.data_processor.fit_transform(train_data, self.TARGET, index_column=self.INDEX)
+        self.X_eval, self.y_eval = self.data_processor.transform(eval_data)
+        if isinstance(self.TARGET, str):
+            self.y_train = self.y_train.to_numpy().flatten()
+            self.y_eval = self.y_eval.to_numpy().flatten()
+        elif isinstance(self.TARGET, list):
+            print("Error: Multitarget problems are stil under construction")
+            raise
+        else:
+            print("Error: where tf you going with that?")
+            
+            
+    
+    def train_models(self) -> Self:
+        if self.data_processor.task_type == TaskType.CLASSIFICATION:
+            self.logistic_regression_model, self.logistic_regression_score = self.train_logistic_regression()
+        elif self.data_processor.task_type == TaskType.REGRESSION:
+            self.linear_regression_model, self.linear_regression_score = self.train_linear_regression()
+        return self
+    
+    # ----------| Regression Tasks |----------
+    def train_linear_regression(self) -> tuple[LinearRegression, float]:
+        model = LinearRegression()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_decission_tree_regressor(self) -> tuple[DecisionTreeRegressor, float]:
+        model = DecisionTreeRegressor()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_random_forest_regressor(self) -> tuple[RandomForestRegressor, float]:
+        model = RandomForestRegressor()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_xgboost_regressor(self) -> tuple[XGBRegressor, float]:
+        model = XGBRegressor()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_catboost_regressor(self) -> tuple[CatBoostRegressor, float]: # FIXME:
+        model = CatBoostRegressor()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    # ----------| Classification Tasks |----------
+    def train_logistic_regression(self) -> tuple[LogisticRegression, float]:
+        model = LogisticRegression()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_decision_tree_classifier(self) -> tuple[DecisionTreeClassifier, float]:
+        model = DecisionTreeClassifier()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_random_forest_classifier(self) -> tuple[RandomForestClassifier, float]:
+        model = RandomForestClassifier()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_xgboost_classifier(self) -> tuple[XGBClassifier, float]:
+        model = XGBClassifier()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score
+    
+    def train_catboost_classifier(self) -> tuple[CatBoostClassifier, float]: # FIXME:
+        model = CatBoostClassifier()
+        model.fit(self.X_train, self.y_train)
+        score = model.score(self.X_eval, self.y_eval)
+        return model, score

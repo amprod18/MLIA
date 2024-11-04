@@ -55,6 +55,8 @@ class FrequencyEncoder(BaseEstimator, TransformerMixin):
         data = self.parser.parse(data)
         for col in data.columns:
             self.freq_dict_[col] = data[col].value_counts(normalize=True).to_dict()
+            
+        self.inverted_dict_ = {v:k for k, v in self.freq_dict_.items()}
 
         return self
 
@@ -70,7 +72,23 @@ class FrequencyEncoder(BaseEstimator, TransformerMixin):
         """
         data = self.parser.parse(data)
         for col in data.columns:
-            data.loc[:, col] = data[col].map(self.freq_dict_[col])
+            data.loc[:, [col]] = data[col].map(self.freq_dict_[col])
+
+        return data
+    
+    def inverse_transform(self, data:DataFrame|Series|ndarray) -> DataFrame:
+        """
+        Transform the data using the frequency encoding.
+
+        Parameters:
+        - X: pandas Series or DataFrame
+
+        Returns:
+        - transformed data
+        """
+        data = self.parser.parse(data)
+        for col in data.columns:
+            data.loc[:, [col]] = data[col].map(self.inverted_dict_[col])
 
         return data
 
@@ -410,6 +428,44 @@ class GeneralEncoder(BaseEstimator, TransformerMixin):
             print(f"Warning: Columns {untransformed_columns} do not have an encoding transformation assigned.")
         
         return encoded_data
+    
+    def inverse_transform(self, data:DataFrame|Series|ndarray) -> DataFrame:
+        """
+        Transform the input data using the fitted encoder.
+
+        Args:
+            data: Input data in one of the following formats:
+                - pandas DataFrame
+                - pandas Series
+                - 2D NumPy array
+
+        Returns:
+            A pandas DataFrame with the encoded data.
+        """
+        data = self.parser.parse(data)
+        assert not not self.encoders_, "You must fit the scaler before transforming" # FIXME: If no column needs encoding it will be treated as non fitted 
+        
+        decoded_data = data.copy()
+        for col, metadata in self.encoders_.items():
+            if metadata['Transformation'] is None:
+                continue
+                
+            elif isinstance(metadata['Transformation'], OneHotEncoder):
+                old_cols = metadata['Transformation'].get_feature_names_out().tolist()
+                new_cols = metadata['Transformation'].feature_names_in_.tolist()
+                decoded_data.loc[:, new_cols] = metadata['Transformation'].inverse_transform(data[old_cols])
+                decoded_data.drop(columns=old_cols, inplace=True)
+            else:
+                decoded_data.loc[:, [f"{col}_categorical"]] = metadata['Transformation'].inverse_transform(data[col].to_numpy().flatten())
+                decoded_data.drop(columns=col, inplace=True)
+                decoded_data.rename(columns={f"{col}_categorical":col}, inplace=True)
+                
+            
+        untransformed_columns = decoded_data.select_dtypes(include=['object', 'category']).columns
+        if not untransformed_columns.empty:
+            print(f"Warning: Columns {untransformed_columns} do not have an encoding transformation assigned.")
+        
+        return decoded_data
 
     def fit_transform(self, data:DataFrame|Series|ndarray, target_data:DataFrame|Series|ndarray) -> DataFrame:
         """
@@ -432,6 +488,7 @@ class GeneralScaler(BaseEstimator, TransformerMixin):
         self.parser:Data2DtoDataFrame = Data2DtoDataFrame()
         self.global_transform:str = transformation
         self.scalers_: dict[str|tuple[str], dict[str, StandardScaler|FunctionTransformer|QuantileTransformer|RobustScaler|MinMaxScaler]] = {}
+        self._minmax_values_dict:dict[str, float] = {}
 
     def _get_outliers_percent(self, data:Series) -> int:
         Q1 = np.percentile(data, 25)
@@ -477,17 +534,19 @@ class GeneralScaler(BaseEstimator, TransformerMixin):
                 reason = f"Data has been found to be normally distributed ({shap=:.4f}) and does not contain many outliers ({outliers=})."
             elif is_skewed and (data[col] > 0).all():
                 # If data is skewed and all values are positive, use Log transformation
-                scaler = FunctionTransformer(np.log1p, validate=True)
+                scaler = FunctionTransformer(np.log1p, inverse_func=lambda y: np.exp(y)-1, validate=True)
                 transformation_nl = "Data is transformed appliying a logarithm."
                 reason = f"Data has been found to be skewed ({skewness=:.4f}) and only contain positive values."
             elif skewness > 0.5:
                 # If positively skewed and data contains non-positive values, shift data then log-transform
-                scaler =  FunctionTransformer(lambda x: np.log1p(x - x.min() + 1), validate=True)
+                scaler =  FunctionTransformer(lambda x: np.log1p(x - x.min() + 1), inverse_func=lambda y: np.exp(y)-2, validate=True)
+                self._minmax_values_dict[col] = data[col].min()
                 transformation_nl = "Data is shifted to be positive (+1) and then transformed appliying a logarithm."
                 reason = f"Data has been found to be positively skewed ({skewness=:.4f}) and contains non-positive values."
             elif skewness < -0.5:
                 # If negatively skewed, reflect and apply log transformation or use PowerTransformer
-                scaler =  FunctionTransformer(lambda x: np.log1p(x.max() - x + 1), validate=True)
+                scaler =  FunctionTransformer(lambda x: np.log1p(x.max() - x + 1), inverse_func=lambda y: 2-np.exp(y), validate=True)
+                self._minmax_values_dict[col] = data[col].max()
                 transformation_nl = "Data is mirrored, shifted to be positive (+1) and then transformed appliying a logarithm."
                 reason = f"Data has been found to be negatively skewed ({skewness=:.4f}) and contains non-positive values."
             elif has_heavy_tails or has_many_outliers:
@@ -549,6 +608,32 @@ class GeneralScaler(BaseEstimator, TransformerMixin):
             print(f"Warning: Columns {untransformed_columns} do not have an scaling transformation assigned.")
         
         return scaled_data
+    
+    def inverse_transform(self, data:DataFrame|Series|ndarray) -> DataFrame:
+        data = self.parser.parse(data)
+        assert not not self.scalers_, "You must fit the scaler before transforming"
+        
+        unscaled_data = data.copy()
+        for col, metadata in self.scalers_.items():
+            if isinstance(col, tuple):
+                unscaled_data.loc[:, [f'{target}_float' for target in col]] = metadata['Transformation'].inverse_transform(data[list(col)])
+                unscaled_data.drop(columns=col, inplace=True) 
+                unscaled_data.rename(columns={f'{target}_float':target for target in col}, inplace=True) 
+            else:
+                if isinstance(metadata['Transformation'], FunctionTransformer) and (col in self._minmax_values_dict.keys()):
+                    unscaled_data.loc[:, [f'{col}_float']] = np.int64(metadata['Transformation'].inverse_transform(data[[col]]))
+                    unscaled_data.loc[:, [f'{col}_float']] = unscaled_data[f'{col}_float'] + self._minmax_values_dict[col]
+                    
+                else:
+                    unscaled_data.loc[:, [f'{col}_float']] = metadata['Transformation'].inverse_transform(data[[col]])
+                unscaled_data.drop(columns=col, inplace=True) 
+                unscaled_data.rename(columns={f'{col}_float':col}, inplace=True) 
+        
+        untransformed_columns = [col for col in data.columns if col not in self.scalers_.keys()]
+        if untransformed_columns:
+            print(f"Warning: Columns {untransformed_columns} do not have an scaling transformation assigned.")
+        
+        return unscaled_data
 
     def fit_transform(self, data:DataFrame|Series|ndarray) -> DataFrame:
         return self.fit(data).transform(data)
@@ -731,6 +816,12 @@ class GeneralDataProcessor:
         corrected_data_X = self.collinearity_fixer.transform(scaled_data_X)
                 
         return corrected_data_X, data_y
+    
+    def inverse_transform(self, corrected_data_X:DataFrame|Series|ndarray, data_y:DataFrame|Series|ndarray) -> DataFrame:
+        dataset = pd.concat([corrected_data_X, data_y], axis=1)
+        unscaled_data = self.gen_scaler.inverse_transform(dataset)
+        decoded_data = self.gen_encoder.inverse_transform(unscaled_data) # FIXME: Fix warnings
+        return decoded_data
     
     def fit_transform(self, dataset:DataFrame|Series|ndarray, target_column:list[str]|str, index_column:str|None=None) -> tuple[DataFrame, DataFrame]:
         return self.fit(dataset, target_column, index_column=index_column).transform(dataset)

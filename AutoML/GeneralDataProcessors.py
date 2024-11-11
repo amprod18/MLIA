@@ -12,6 +12,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from enum import Enum, auto
 
+from IPython.display import display, HTML
+
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -453,10 +455,10 @@ class GeneralEncoder(BaseEstimator, TransformerMixin):
             elif isinstance(metadata['Transformation'], OneHotEncoder):
                 old_cols = metadata['Transformation'].get_feature_names_out().tolist()
                 new_cols = metadata['Transformation'].feature_names_in_.tolist()
-                decoded_data.loc[:, new_cols] = metadata['Transformation'].inverse_transform(data[old_cols])
+                decoded_data.loc[:, new_cols] = metadata['Transformation'].inverse_transform(decoded_data[old_cols])
                 decoded_data.drop(columns=old_cols, inplace=True)
             else:
-                decoded_data.loc[:, [f"{col}_categorical"]] = metadata['Transformation'].inverse_transform(data[col].to_numpy().flatten())
+                decoded_data.loc[:, [f"{col}_categorical"]] = metadata['Transformation'].inverse_transform(np.int8(decoded_data[[col]].to_numpy().flatten()))
                 decoded_data.drop(columns=col, inplace=True)
                 decoded_data.rename(columns={f"{col}_categorical":col}, inplace=True)
                 
@@ -484,11 +486,12 @@ class GeneralEncoder(BaseEstimator, TransformerMixin):
     
 
 class GeneralScaler(BaseEstimator, TransformerMixin):
-    def __init__(self, transformation=None) -> None:
+    def __init__(self, transformation=None, float_tol:float=1e-5) -> None:
         self.parser:Data2DtoDataFrame = Data2DtoDataFrame()
         self.global_transform:str = transformation
         self.scalers_: dict[str|tuple[str], dict[str, StandardScaler|FunctionTransformer|QuantileTransformer|RobustScaler|MinMaxScaler]] = {}
         self._minmax_values_dict:dict[str, float] = {}
+        self.float_tol = float_tol
 
     def _get_outliers_percent(self, data:Series) -> int:
         Q1 = np.percentile(data, 25)
@@ -534,19 +537,19 @@ class GeneralScaler(BaseEstimator, TransformerMixin):
                 reason = f"Data has been found to be normally distributed ({shap=:.4f}) and does not contain many outliers ({outliers=})."
             elif is_skewed and (data[col] > 0).all():
                 # If data is skewed and all values are positive, use Log transformation
-                scaler = FunctionTransformer(np.log1p, inverse_func=lambda y: np.exp(y)-1, validate=True)
+                scaler = FunctionTransformer(np.log1p, inverse_func=lambda y: np.exp(y)-1, validate=True) # y = log(x) -> e^y - 1 = x
                 transformation_nl = "Data is transformed appliying a logarithm."
                 reason = f"Data has been found to be skewed ({skewness=:.4f}) and only contain positive values."
             elif skewness > 0.5:
                 # If positively skewed and data contains non-positive values, shift data then log-transform
-                scaler =  FunctionTransformer(lambda x: np.log1p(x - x.min() + 1), inverse_func=lambda y: np.exp(y)-2, validate=True)
                 self._minmax_values_dict[col] = data[col].min()
+                scaler =  FunctionTransformer(lambda x: np.log1p(x - self._minmax_values_dict[col] + 1), inverse_func=lambda y: np.exp(y)-1, validate=True) # y = log(1+(x - x.min() + 1)) -> e^y - 2 + x.min() = x
                 transformation_nl = "Data is shifted to be positive (+1) and then transformed appliying a logarithm."
                 reason = f"Data has been found to be positively skewed ({skewness=:.4f}) and contains non-positive values."
             elif skewness < -0.5:
                 # If negatively skewed, reflect and apply log transformation or use PowerTransformer
-                scaler =  FunctionTransformer(lambda x: np.log1p(x.max() - x + 1), inverse_func=lambda y: 2-np.exp(y), validate=True)
                 self._minmax_values_dict[col] = data[col].max()
+                scaler =  FunctionTransformer(lambda x: np.log1p(self._minmax_values_dict[col] - x + 1), inverse_func=lambda y: 2-np.exp(y), validate=True) # y = log(1+(x.max() - x + 1)) -> 2 - e^y + x.max() = x
                 transformation_nl = "Data is mirrored, shifted to be positive (+1) and then transformed appliying a logarithm."
                 reason = f"Data has been found to be negatively skewed ({skewness=:.4f}) and contains non-positive values."
             elif has_heavy_tails or has_many_outliers:
@@ -621,8 +624,9 @@ class GeneralScaler(BaseEstimator, TransformerMixin):
                 unscaled_data.rename(columns={f'{target}_float':target for target in col}, inplace=True) 
             else:
                 if isinstance(metadata['Transformation'], FunctionTransformer) and (col in self._minmax_values_dict.keys()):
-                    unscaled_data.loc[:, [f'{col}_float']] = np.int64(metadata['Transformation'].inverse_transform(data[[col]]))
-                    unscaled_data.loc[:, [f'{col}_float']] = unscaled_data[f'{col}_float'] + self._minmax_values_dict[col]
+                    unscaled_data.loc[:, [f'{col}_float']] = metadata['Transformation'].inverse_transform(data[[col]]) + self._minmax_values_dict[col]
+                    # int_thresh_mask = (unscaled_data[f'{col}_float']-unscaled_data[f'{col}_float'].apply(np.int64)) < self.float_tol 
+                    # unscaled_data.loc[int_thresh_mask, [f'{col}_float']] = unscaled_data.loc[int_thresh_mask, [f'{col}_float']].apply(np.round, decimals=0).apply(np.int64)
                     
                 else:
                     unscaled_data.loc[:, [f'{col}_float']] = metadata['Transformation'].inverse_transform(data[[col]])
@@ -753,6 +757,7 @@ class GeneralDataProcessor:
     
     def fit(self, dataset:DataFrame|Series|ndarray, target_column:list[str]|str, index_column:str|None=None) -> Self:
         dataset = self.parser.parse(dataset)
+        self.original_dtypes = dataset.dtypes.to_dict()
         self.original_data = dataset.copy()
         self.index_column = index_column
         self.target_column = target_column
@@ -821,6 +826,18 @@ class GeneralDataProcessor:
         dataset = pd.concat([corrected_data_X, data_y], axis=1)
         unscaled_data = self.gen_scaler.inverse_transform(dataset)
         decoded_data = self.gen_encoder.inverse_transform(unscaled_data) # FIXME: Fix warnings
+
+        for col in decoded_data.columns:
+            try:
+                if self.original_dtypes[col] == "int64":
+                    decoded_data.loc[:, [f"{col}_original_dtype"]] = decoded_data[col].apply(np.round, decimals=0).astype(self.original_dtypes[col])
+                else:
+                    decoded_data.loc[:, [f"{col}_original_dtype"]] = decoded_data[col].astype(self.original_dtypes[col])
+                decoded_data = decoded_data.drop(columns=col)
+                decoded_data = decoded_data.rename(columns={f"{col}_original_dtype":col})
+            except KeyError as e:
+                print(f'[WARNIGN]: columns {col} not present int the decoded data')
+                continue
         return decoded_data
     
     def fit_transform(self, dataset:DataFrame|Series|ndarray, target_column:list[str]|str, index_column:str|None=None) -> tuple[DataFrame, DataFrame]:
